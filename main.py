@@ -99,7 +99,7 @@ def main():
     agent_manager = AgentManager(
         cwd=agent_cfg.get("cwd", "."),
         allowed_tools=agent_cfg.get("allowed_tools", ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]),
-        timeout_minutes=session_cfg.get("timeout_minutes", 30),
+        timeout_minutes=agent_cfg.get("timeout_minutes", 120),
         max_agents=agent_cfg.get("max_agents", 3),
     )
 
