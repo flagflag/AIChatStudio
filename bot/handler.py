@@ -23,44 +23,54 @@ from bot.agent_manager import AgentManager
 logger = logging.getLogger(__name__)
 
 
-def _build_approval_card(request_id: str, user_id: str, text: str) -> str:
+def _build_approval_card(request_id: str, user_id: str, text: str,
+                         chat_name: str = "", chat_id: str = "") -> str:
     """构建审批卡片 JSON。"""
     # 截断过长的消息预览
     preview = text if len(text) <= 200 else text[:200] + "..."
+    elements = []
+    if chat_name or chat_id:
+        link = f"https://applink.feishu.cn/client/chat/open?openChatId={chat_id}" if chat_id else ""
+        source_text = f"**来源群聊：** {chat_name or chat_id}"
+        if link:
+            source_text += f"  [打开群聊]({link})"
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": source_text},
+        })
+    elements.append({
+        "tag": "div",
+        "text": {"tag": "lark_md", "content": f"**发送者：** <at id={user_id}></at>"},
+    })
+    elements.append({
+        "tag": "div",
+        "text": {"tag": "lark_md", "content": f"**消息内容：**\n{preview}"},
+    })
+    elements.append({"tag": "hr"})
+    elements.append({
+        "tag": "action",
+        "actions": [
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "✅ 批准执行"},
+                "type": "primary",
+                "value": {"action": "approve", "request_id": request_id},
+            },
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "❌ 拒绝"},
+                "type": "danger",
+                "value": {"action": "reject", "request_id": request_id},
+            },
+        ],
+    })
     card = {
         "config": {"wide_screen_mode": True},
         "header": {
             "title": {"tag": "plain_text", "content": "🔒 Agent 执行审批"},
             "template": "orange",
         },
-        "elements": [
-            {
-                "tag": "div",
-                "text": {"tag": "lark_md", "content": f"**发送者：** <at id={user_id}></at>"},
-            },
-            {
-                "tag": "div",
-                "text": {"tag": "lark_md", "content": f"**消息内容：**\n{preview}"},
-            },
-            {"tag": "hr"},
-            {
-                "tag": "action",
-                "actions": [
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "✅ 批准执行"},
-                        "type": "primary",
-                        "value": {"action": "approve", "request_id": request_id},
-                    },
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "❌ 拒绝"},
-                        "type": "danger",
-                        "value": {"action": "reject", "request_id": request_id},
-                    },
-                ],
-            },
-        ],
+        "elements": elements,
     }
     return json.dumps(card)
 
@@ -185,9 +195,12 @@ class MessageHandler:
         if not text and images:
             text = ""
 
-        # 话题内消息 → 路由到 Agent
+        # 话题内消息 → 需要审批 or 路由到 Agent
         if thread_id:
-            self._handle_agent_message(thread_id, text, message_id, images)
+            if self._admin_ids and user_id not in self._admin_ids and not self._is_user_approved(user_id):
+                self._send_thread_approval_request(thread_id, message_id, chat_id, text, images, user_id)
+            else:
+                self._handle_agent_message(thread_id, text, message_id, images)
             return
 
         # 话题外的命令处理
@@ -243,9 +256,9 @@ class MessageHandler:
         del self._approved_users[user_id]
         return False
 
-    def _send_approval_request(self, message_id: str, chat_id: str, text: str,
-                                images: list[dict], user_id: str):
-        """发送审批卡片，等待管理员批准。"""
+    def _create_pending_request(self, message_id: str, chat_id: str, text: str,
+                                images: list[dict], user_id: str, **extra) -> str:
+        """创建待审批请求，返回 request_id。"""
         request_id = uuid.uuid4().hex[:12]
         self._pending_requests[request_id] = {
             "message_id": message_id,
@@ -254,6 +267,7 @@ class MessageHandler:
             "images": images,
             "user_id": user_id,
             "timestamp": time.time(),
+            **extra,
         }
         # 清理超过 30 分钟的过期请求
         cutoff = time.time() - 1800
@@ -261,19 +275,12 @@ class MessageHandler:
             k: v for k, v in self._pending_requests.items()
             if v["timestamp"] > cutoff
         }
+        return request_id
 
-        # 在话题里回复提示，记录话题信息供审批通过后使用
-        resp = self._reply_in_thread(message_id, "🔒 该请求需要管理员审批，请稍候...")
-        hint_msg_id = None
-        thread_id = None
-        if resp and resp.success() and resp.data:
-            hint_msg_id = getattr(resp.data, "message_id", None)
-            thread_id = getattr(resp.data, "thread_id", None)
-        self._pending_requests[request_id]["hint_msg_id"] = hint_msg_id
-        self._pending_requests[request_id]["thread_id"] = thread_id
-
-        card_json = _build_approval_card(request_id, user_id, text)
-        # 私信发送给每个管理员
+    def _send_approval_card(self, request_id: str, user_id: str, text: str, chat_id: str):
+        """私信发送审批卡片给所有管理员。"""
+        chat_name = self._get_chat_name(chat_id)
+        card_json = _build_approval_card(request_id, user_id, text, chat_name, chat_id)
         for admin_id in self._admin_ids:
             body = CreateMessageRequestBody.builder() \
                 .receive_id(admin_id) \
@@ -287,6 +294,41 @@ class MessageHandler:
             resp = self.lark_client.im.v1.message.create(request)
             if not resp.success():
                 logger.error("发送审批卡片给 %s 失败: %s - %s", admin_id, resp.code, resp.msg)
+
+    def _send_approval_request(self, message_id: str, chat_id: str, text: str,
+                                images: list[dict], user_id: str):
+        """话题外新消息的审批流程。"""
+        request_id = self._create_pending_request(
+            message_id, chat_id, text, images, user_id, source="new")
+
+        # 在话题里回复提示，记录话题信息供审批通过后使用
+        resp = self._reply_in_thread(message_id, "🔒 该请求需要管理员审批，请稍候...")
+        hint_msg_id = None
+        thread_id = None
+        if resp and resp.success() and resp.data:
+            hint_msg_id = getattr(resp.data, "message_id", None)
+            thread_id = getattr(resp.data, "thread_id", None)
+        self._pending_requests[request_id]["hint_msg_id"] = hint_msg_id
+        self._pending_requests[request_id]["thread_id"] = thread_id
+
+        self._send_approval_card(request_id, user_id, text, chat_id)
+
+    def _send_thread_approval_request(self, thread_id: str, message_id: str,
+                                       chat_id: str, text: str,
+                                       images: list[dict], user_id: str):
+        """话题内消息的审批流程。"""
+        request_id = self._create_pending_request(
+            message_id, chat_id, text, images, user_id,
+            source="thread", thread_id=thread_id)
+
+        # 在话题内回复提示
+        resp = self._reply_to_message(message_id, "🔒 该请求需要管理员审批，请稍候...")
+        hint_msg_id = None
+        if resp and resp.success() and resp.data:
+            hint_msg_id = getattr(resp.data, "message_id", None)
+        self._pending_requests[request_id]["hint_msg_id"] = hint_msg_id
+
+        self._send_approval_card(request_id, user_id, text, chat_id)
 
     def handle_card_action(self, action_value: dict, operator_id: str) -> dict:
         """处理卡片按钮点击事件。返回 {toast, card?}。"""
@@ -306,12 +348,19 @@ class MessageHandler:
             logger.info("管理员 %s 批准了请求 %s", operator_id, request_id)
             # 记录该用户已被批准
             self._approved_users[pending["user_id"]] = time.time()
-            # 启动 Agent（在已有话题中继续）
-            threading.Thread(
-                target=self._handle_approved_agent,
-                args=(pending,),
-                daemon=True,
-            ).start()
+            # 根据来源选择处理方式
+            if pending.get("source") == "thread":
+                threading.Thread(
+                    target=self._handle_approved_thread_message,
+                    args=(pending,),
+                    daemon=True,
+                ).start()
+            else:
+                threading.Thread(
+                    target=self._handle_approved_agent,
+                    args=(pending,),
+                    daemon=True,
+                ).start()
             return {
                 "toast": {"type": "success", "content": "已批准，Agent 正在启动"},
                 "card": self._build_result_card("✅ Agent 执行已批准", "green",
@@ -319,6 +368,10 @@ class MessageHandler:
             }
         else:
             logger.info("管理员 %s 拒绝了请求 %s", operator_id, request_id)
+            # 在话题内通知拒绝
+            hint_msg_id = pending.get("hint_msg_id")
+            if hint_msg_id:
+                self._reply_to_message(hint_msg_id, "❌ 管理员已拒绝该请求")
             return {
                 "toast": {"type": "info", "content": "已拒绝"},
                 "card": self._build_result_card("❌ Agent 执行已拒绝", "red",
@@ -354,6 +407,31 @@ class MessageHandler:
                 session.messages.pop()
 
         self._reply(chat_id, reply)
+
+    def _handle_approved_thread_message(self, pending: dict):
+        """审批通过后，在已有话题中继续 Agent 对话。"""
+        thread_id = pending["thread_id"]
+        message_id = pending["message_id"]
+        text = pending["text"]
+        images = pending.get("images")
+        hint_msg_id = pending.get("hint_msg_id")
+
+        if hint_msg_id:
+            self._reply_to_message(hint_msg_id, "🤖 审批已通过，正在处理中...")
+
+        try:
+            reply = self.agent_manager.chat(thread_id, text, images=images)
+        except Exception as e:
+            logger.exception("Agent 调用失败")
+            reply = f"Agent 调用失败: {e}"
+
+        target_id = hint_msg_id or message_id
+        resp = self._reply_to_message(target_id, reply)
+
+        reply_msg_id = None
+        if resp and resp.success() and resp.data:
+            reply_msg_id = getattr(resp.data, "message_id", None)
+        self.agent_manager.set_reply_message_id(thread_id, reply_msg_id or target_id)
 
     def _handle_approved_agent(self, pending: dict):
         """审批通过后，在已有话题中启动 Agent。"""
@@ -467,6 +545,20 @@ class MessageHandler:
         except Exception:
             logger.exception("下载图片异常: %s", image_key)
         return None
+
+    def _get_chat_name(self, chat_id: str) -> str:
+        """获取群聊名称。"""
+        try:
+            from lark_oapi.api.im.v1 import GetChatRequest
+            request = GetChatRequest.builder().chat_id(chat_id).build()
+            resp = self.lark_client.im.v1.chat.get(request)
+            if resp.success() and resp.data:
+                return resp.data.name or ""
+            else:
+                logger.warning("获取群聊名称失败: %s - %s", resp.code, resp.msg)
+        except Exception:
+            logger.exception("获取群聊名称异常: %s", chat_id)
+        return ""
 
     @staticmethod
     def _extract_post_content(content: dict) -> tuple[str, list[str]]:
