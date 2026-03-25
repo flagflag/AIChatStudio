@@ -99,6 +99,7 @@ class MessageHandler:
         bot_open_id: str = "",
         feishu_cfg: dict | None = None,
         admin_ids: list[str] | None = None,
+        approval_expire_minutes: int = 0,
     ):
         self.providers = providers
         self.default_provider = default_provider
@@ -108,9 +109,12 @@ class MessageHandler:
         self.bot_open_id = bot_open_id
         self._feishu_cfg = feishu_cfg or {}
         self._admin_ids = admin_ids or []
+        self._approval_expire = approval_expire_minutes * 60
         self._processed_msgs: dict[str, float] = {}
         # 待审批请求：request_id -> {message_id, text, images, user_id, timestamp}
         self._pending_requests: dict[str, dict] = {}
+        # 已批准用户：user_open_id -> 批准时间戳
+        self._approved_users: dict[str, float] = {}
 
     def handle(self, event_data: dict):
         """处理飞书消息事件"""
@@ -219,8 +223,8 @@ class MessageHandler:
                 self._handle_provider_chat(key, chat_id, user_id, user_text)
                 return
 
-        # 普通消息 → 管理员直接执行，非管理员需要审批
-        if self._admin_ids and user_id not in self._admin_ids:
+        # 普通消息 → 管理员/已批准用户直接执行，其他人需要审批
+        if self._admin_ids and user_id not in self._admin_ids and not self._is_user_approved(user_id):
             self._send_approval_request(message_id, chat_id, text, images, user_id)
         else:
             threading.Thread(
@@ -228,6 +232,16 @@ class MessageHandler:
                 args=(message_id, text, images),
                 daemon=True,
             ).start()
+
+    def _is_user_approved(self, user_id: str) -> bool:
+        """检查用户是否在批准有效期内。"""
+        if not self._approval_expire or user_id not in self._approved_users:
+            return False
+        elapsed = time.time() - self._approved_users[user_id]
+        if elapsed < self._approval_expire:
+            return True
+        del self._approved_users[user_id]
+        return False
 
     def _send_approval_request(self, message_id: str, chat_id: str, text: str,
                                 images: list[dict], user_id: str):
@@ -248,18 +262,31 @@ class MessageHandler:
             if v["timestamp"] > cutoff
         }
 
+        # 在话题里回复提示，记录话题信息供审批通过后使用
+        resp = self._reply_in_thread(message_id, "🔒 该请求需要管理员审批，请稍候...")
+        hint_msg_id = None
+        thread_id = None
+        if resp and resp.success() and resp.data:
+            hint_msg_id = getattr(resp.data, "message_id", None)
+            thread_id = getattr(resp.data, "thread_id", None)
+        self._pending_requests[request_id]["hint_msg_id"] = hint_msg_id
+        self._pending_requests[request_id]["thread_id"] = thread_id
+
         card_json = _build_approval_card(request_id, user_id, text)
-        body = ReplyMessageRequestBody.builder() \
-            .msg_type("interactive") \
-            .content(card_json) \
-            .build()
-        request = ReplyMessageRequest.builder() \
-            .message_id(message_id) \
-            .request_body(body) \
-            .build()
-        resp = self.lark_client.im.v1.message.reply(request)
-        if not resp.success():
-            logger.error("发送审批卡片失败: %s - %s", resp.code, resp.msg)
+        # 私信发送给每个管理员
+        for admin_id in self._admin_ids:
+            body = CreateMessageRequestBody.builder() \
+                .receive_id(admin_id) \
+                .msg_type("interactive") \
+                .content(card_json) \
+                .build()
+            request = CreateMessageRequest.builder() \
+                .receive_id_type("open_id") \
+                .request_body(body) \
+                .build()
+            resp = self.lark_client.im.v1.message.create(request)
+            if not resp.success():
+                logger.error("发送审批卡片给 %s 失败: %s - %s", admin_id, resp.code, resp.msg)
 
     def handle_card_action(self, action_value: dict, operator_id: str) -> dict:
         """处理卡片按钮点击事件。返回 {toast, card?}。"""
@@ -277,10 +304,12 @@ class MessageHandler:
 
         if action == "approve":
             logger.info("管理员 %s 批准了请求 %s", operator_id, request_id)
-            # 启动 Agent
+            # 记录该用户已被批准
+            self._approved_users[pending["user_id"]] = time.time()
+            # 启动 Agent（在已有话题中继续）
             threading.Thread(
-                target=self._handle_new_agent_thread,
-                args=(pending["message_id"], pending["text"], pending["images"]),
+                target=self._handle_approved_agent,
+                args=(pending,),
                 daemon=True,
             ).start()
             return {
@@ -325,6 +354,34 @@ class MessageHandler:
                 session.messages.pop()
 
         self._reply(chat_id, reply)
+
+    def _handle_approved_agent(self, pending: dict):
+        """审批通过后，在已有话题中启动 Agent。"""
+        hint_msg_id = pending.get("hint_msg_id")
+        thread_id = pending.get("thread_id")
+        message_id = pending["message_id"]
+        text = pending["text"]
+        images = pending.get("images")
+
+        # 在话题内发送启动提示
+        if hint_msg_id:
+            self._reply_to_message(hint_msg_id, "🤖 审批已通过，Agent 正在处理中...")
+
+        thread_key = thread_id or f"pending:{message_id}"
+        try:
+            reply = self.agent_manager.chat(thread_key, text, images=images)
+        except Exception as e:
+            logger.exception("Agent 调用失败")
+            reply = f"Agent 调用失败: {e}"
+
+        # 回复到话题内
+        target_id = hint_msg_id or message_id
+        resp = self._reply_to_message(target_id, reply)
+
+        reply_msg_id = None
+        if resp and resp.success() and resp.data:
+            reply_msg_id = getattr(resp.data, "message_id", None)
+        self.agent_manager.set_reply_message_id(thread_key, reply_msg_id or target_id)
 
     def _handle_new_agent_thread(self, message_id: str, text: str, images: list[dict] | None = None):
         """创建新的飞书话题并启动 Agent 会话。"""

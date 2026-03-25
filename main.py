@@ -106,7 +106,7 @@ def main():
         cwd=agent_cfg.get("cwd", "."),
         allowed_tools=agent_cfg.get("allowed_tools", ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]),
         timeout_minutes=agent_cfg.get("timeout_minutes", 120),
-        max_agents=agent_cfg.get("max_agents", 3),
+        max_agents=agent_cfg.get("max_agents", 10),
         system_prompt=agent_cfg.get("system_prompt", ""),
         temp_dir=agent_cfg.get("temp_dir", ""),
     )
@@ -122,6 +122,7 @@ def main():
         bot_open_id=bot_open_id,
         feishu_cfg=feishu_cfg,
         admin_ids=admin_ids,
+        approval_expire_minutes=agent_cfg.get("approval_expire_minutes", 0),
     )
 
     # 注册 Agent 清理通知回调
