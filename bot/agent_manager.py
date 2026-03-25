@@ -182,6 +182,10 @@ class AgentManager:
         session = self._sessions[thread_key]
         return await session.chat(message, images=images)
 
+    def has_session(self, thread_key: str) -> bool:
+        """检查是否存在指定的 Agent session。"""
+        return thread_key in self._sessions
+
     def bind_thread(self, temp_key: str, thread_id: str):
         """将临时 key 重新绑定到实际的 thread_id。"""
         if temp_key in self._sessions and temp_key != thread_id:

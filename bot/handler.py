@@ -12,6 +12,7 @@ from lark_oapi.api.im.v1 import (
     CreateMessageRequest,
     CreateMessageRequestBody,
     GetMessageResourceRequest,
+    ListMessageRequest,
     ReplyMessageRequest,
     ReplyMessageRequestBody,
 )
@@ -125,6 +126,10 @@ class MessageHandler:
         self._pending_requests: dict[str, dict] = {}
         # 已批准用户：user_open_id -> 批准时间戳
         self._approved_users: dict[str, float] = {}
+        # 话题消息历史：thread_id -> [{user_id, text, is_bot_mention, timestamp}]
+        self._thread_messages: dict[str, list[dict]] = {}
+        # 用户名缓存：open_id -> 名字
+        self._user_name_cache: dict[str, str] = {}
 
     def handle(self, event_data: dict):
         """处理飞书消息事件"""
@@ -139,8 +144,12 @@ class MessageHandler:
         logger.debug("收到消息: chat_type=%s, thread_id=%s, mentions=%s, user_id=%s, bot_open_id=%s",
                      chat_type, thread_id, mentions, user_id, self.bot_open_id)
 
-        # 忽略机器人自己发送的消息
+        # 机器人自己的消息：仅存储话题历史，不处理
         if self.bot_open_id and user_id == self.bot_open_id:
+            if thread_id:
+                bot_text = self._extract_text_quick(message)
+                if bot_text:
+                    self._store_thread_message(thread_id, user_id, bot_text, is_bot_mention=False)
             return
 
         # 消息去重
@@ -178,16 +187,28 @@ class MessageHandler:
                 if img:
                     images.append(img)
 
-        # 群聊中需要 @机器人 才触发（私聊不需要）
+        # 判断是否 @了机器人
+        is_bot_mentioned = True  # 私聊默认触发
         if chat_type == "group":
             is_bot_mentioned = any(
                 getattr(getattr(m, "id", None), "open_id", None) == self.bot_open_id
                 for m in mentions
             ) if self.bot_open_id else bool(mentions)
-            if not is_bot_mentioned:
-                return
 
-        text = re.sub(r"@_user_\d+\s*", "", text).strip()
+        # 清理 @提及标记
+        clean_text = re.sub(r"@_user_\d+\s*", "", text).strip()
+
+        # 话题内消息：无论是否 @机器人 都存储（用于上下文提取）
+        if thread_id:
+            self._store_thread_message(thread_id, user_id, clean_text, is_bot_mentioned)
+            if not is_bot_mentioned:
+                return  # 存储后直接返回，不处理
+
+        # 群聊非话题消息需要 @机器人 才触发
+        if chat_type == "group" and not is_bot_mentioned:
+            return
+
+        text = clean_text
         if not text and not images:
             return
 
@@ -245,6 +266,157 @@ class MessageHandler:
                 args=(message_id, text, images),
                 daemon=True,
             ).start()
+
+    def _extract_text_quick(self, message: dict) -> str:
+        """轻量提取消息文本（不下载图片），用于存储机器人自己的消息。"""
+        msg_type = message.get("message_type", "")
+        try:
+            content = json.loads(message.get("content", "{}"))
+        except json.JSONDecodeError:
+            return ""
+        if msg_type == "text":
+            return content.get("text", "").strip()
+        elif msg_type == "post":
+            text, _ = self._extract_post_content(content)
+            return text
+        return ""
+
+    def _store_thread_message(self, thread_id: str, user_id: str, text: str, is_bot_mention: bool):
+        """存储话题内的消息，用于上下文提取。"""
+        if thread_id not in self._thread_messages:
+            self._thread_messages[thread_id] = []
+        self._thread_messages[thread_id].append({
+            "user_id": user_id,
+            "text": text,
+            "is_bot_mention": is_bot_mention,
+            "timestamp": time.time(),
+        })
+        # 每个话题最多保留 200 条
+        if len(self._thread_messages[thread_id]) > 200:
+            self._thread_messages[thread_id] = self._thread_messages[thread_id][-200:]
+
+    def _get_thread_context(self, thread_id: str) -> str:
+        """提取话题上下文。
+
+        - Agent 不存在（新启动）：通过飞书 API 拉取完整话题历史（含 AI 回复）。
+        - Agent 已存在：返回上一次 @机器人 到当前之间的其他用户对话。
+        """
+        if not self.agent_manager.has_session(thread_id):
+            # 新 Agent → 通过飞书 API 拉取话题历史
+            return self._fetch_thread_history(thread_id)
+
+        # 已有 Agent → 取两次 @机器人 之间的对话（本地存储）
+        messages = self._thread_messages.get(thread_id, [])
+        if len(messages) < 2:
+            return ""
+
+        context_msgs = []
+        for i in range(len(messages) - 2, -1, -1):
+            msg = messages[i]
+            if msg["is_bot_mention"]:
+                break
+            # 跳过机器人自己的消息（Agent 已有记忆）
+            if self.bot_open_id and msg["user_id"] == self.bot_open_id:
+                continue
+            context_msgs.insert(0, msg)
+
+        if not context_msgs:
+            return ""
+
+        lines = []
+        for msg in context_msgs:
+            name = self._get_user_name(msg["user_id"])
+            lines.append(f"{name}: {msg['text']}")
+
+        return "[话题上下文 - 以下是上次 @机器人 之后其他用户的对话]\n" + "\n".join(lines)
+
+    def _fetch_thread_history(self, thread_id: str) -> str:
+        """通过飞书 API 拉取话题历史消息（用于新 Agent 启动时获取完整上下文）。"""
+        try:
+            all_lines = []
+            page_token = None
+
+            while True:
+                builder = ListMessageRequest.builder() \
+                    .container_id_type("thread") \
+                    .container_id(thread_id) \
+                    .sort_type("ByCreateTimeAsc") \
+                    .page_size(50)
+                if page_token:
+                    builder = builder.page_token(page_token)
+
+                request = builder.build()
+                resp = self.lark_client.im.v1.message.list(request)
+
+                if not resp.success():
+                    logger.error("拉取话题历史失败: %s - %s", resp.code, resp.msg)
+                    return ""
+
+                if resp.data and resp.data.items:
+                    for msg in resp.data.items:
+                        # 跳过已删除的消息
+                        if msg.deleted:
+                            continue
+
+                        msg_type = msg.msg_type or ""
+                        # 跳过不支持的消息类型
+                        if msg_type not in ("text", "post"):
+                            continue
+
+                        # 提取发送者
+                        sender_id = ""
+                        if msg.sender:
+                            sender_id = msg.sender.id or ""
+
+                        # 提取文本
+                        text = ""
+                        try:
+                            content = json.loads(msg.body.content or "{}")
+                            if msg_type == "text":
+                                text = content.get("text", "")
+                            elif msg_type == "post":
+                                text, _ = self._extract_post_content(content)
+                        except (json.JSONDecodeError, AttributeError):
+                            continue
+
+                        if not text:
+                            continue
+
+                        # 清理 @提及标记
+                        text = re.sub(r"@_user_\d+\s*", "", text).strip()
+                        if not text:
+                            continue
+
+                        # 确定显示名称
+                        if self.bot_open_id and sender_id == self.bot_open_id:
+                            name = "AI助手"
+                        else:
+                            name = self._get_user_name(sender_id)
+
+                        # 截断过长的单条消息
+                        if len(text) > 500:
+                            text = text[:500] + "..."
+
+                        all_lines.append(f"{name}: {text}")
+
+                if not resp.data or not resp.data.has_more:
+                    break
+                page_token = resp.data.page_token
+
+            if not all_lines:
+                return ""
+
+            # 排除最后一条（当前用户的查询消息）
+            if len(all_lines) > 1:
+                all_lines = all_lines[:-1]
+            else:
+                return ""
+
+            return "[话题历史 - Agent 重新启动，以下是之前的完整对话]\n" + "\n".join(all_lines)
+
+        except Exception:
+            logger.exception("拉取话题历史异常")
+            return ""
 
     def _is_user_approved(self, user_id: str) -> bool:
         """检查用户是否在批准有效期内。"""
@@ -419,8 +591,14 @@ class MessageHandler:
         if hint_msg_id:
             self._reply_to_message(hint_msg_id, "🤖 审批已通过，正在处理中...")
 
+        # 拼接上下文
+        context = self._get_thread_context(thread_id)
+        prompt = text
+        if context:
+            prompt = f"{context}\n\n[用户消息]\n{text}"
+
         try:
-            reply = self.agent_manager.chat(thread_id, text, images=images)
+            reply = self.agent_manager.chat(thread_id, prompt, images=images)
         except Exception as e:
             logger.exception("Agent 调用失败")
             reply = f"Agent 调用失败: {e}"
@@ -493,6 +671,9 @@ class MessageHandler:
 
     def _handle_agent_message(self, thread_id: str, text: str, message_id: str, images: list[dict] | None = None):
         """在已有话题内继续 Agent 对话（异步执行）。"""
+        # 提取上下文（在启动线程前，避免竞态）
+        context = self._get_thread_context(thread_id)
+
         def _run():
             # 先发提示
             resp = self._reply_to_message(message_id, "🤖 正在思考中...")
@@ -500,8 +681,13 @@ class MessageHandler:
             if resp and resp.success() and resp.data:
                 hint_msg_id = getattr(resp.data, "message_id", None)
 
+            # 拼接上下文
+            prompt = text
+            if context:
+                prompt = f"{context}\n\n[用户消息]\n{text}"
+
             try:
-                reply = self.agent_manager.chat(thread_id, text, images=images)
+                reply = self.agent_manager.chat(thread_id, prompt, images=images)
             except Exception as e:
                 logger.exception("Agent 调用失败")
                 reply = f"Agent 调用失败: {e}"
@@ -545,6 +731,23 @@ class MessageHandler:
         except Exception:
             logger.exception("下载图片异常: %s", image_key)
         return None
+
+    def _get_user_name(self, open_id: str) -> str:
+        """获取用户名（带缓存）。"""
+        if open_id in self._user_name_cache:
+            return self._user_name_cache[open_id]
+        try:
+            from lark_oapi.api.contact.v3 import GetUserRequest
+            request = GetUserRequest.builder().user_id(open_id).user_id_type("open_id").build()
+            resp = self.lark_client.contact.v3.user.get(request)
+            if resp.success() and resp.data and resp.data.user:
+                name = resp.data.user.name or open_id
+                self._user_name_cache[open_id] = name
+                return name
+        except Exception:
+            logger.debug("获取用户名失败: %s", open_id)
+        self._user_name_cache[open_id] = open_id
+        return open_id
 
     def _get_chat_name(self, chat_id: str) -> str:
         """获取群聊名称。"""
