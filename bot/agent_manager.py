@@ -1,7 +1,10 @@
 import atexit
 import asyncio
+import base64
 import logging
+import os
 import signal
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -15,9 +18,11 @@ logger = logging.getLogger(__name__)
 class AgentSession:
     """单个 Agent 会话，绑定到一个飞书话题。"""
 
-    def __init__(self, cwd: str, allowed_tools: list[str]):
+    def __init__(self, cwd: str, allowed_tools: list[str], system_prompt: str = "", temp_dir: str = ""):
         self._cwd = cwd
         self._allowed_tools = allowed_tools
+        self._system_prompt = system_prompt
+        self._temp_dir = temp_dir
         self._client: ClaudeSDKClient | None = None
         self._connected = False
         self._lock = asyncio.Lock()
@@ -29,6 +34,7 @@ class AgentSession:
             options = ClaudeAgentOptions(
                 cwd=self._cwd,
                 allowed_tools=self._allowed_tools,
+                system_prompt=self._system_prompt or None,
                 setting_sources=["project"],
                 permission_mode="bypassPermissions",
             )
@@ -41,52 +47,61 @@ class AgentSession:
             await self._ensure_connected()
             self.last_active = time.time()
 
+            saved_files = []
             if images:
-                # 构建多模态输入
-                prompt = self._build_multimodal_prompt(message, images)
+                prompt = self._save_images_and_build_prompt(message, images, saved_files, self._temp_dir)
             else:
                 prompt = message
 
-            await self._client.query(prompt)
+            try:
+                await self._client.query(prompt)
 
-            result_text = ""
-            async for msg in self._client.receive_response():
-                if isinstance(msg, AssistantMessage):
-                    for block in msg.content:
-                        if isinstance(block, TextBlock):
-                            result_text += block.text
-                elif isinstance(msg, ResultMessage):
-                    break
+                result_text = ""
+                async for msg in self._client.receive_response():
+                    if isinstance(msg, AssistantMessage):
+                        for block in msg.content:
+                            if isinstance(block, TextBlock):
+                                result_text += block.text
+                    elif isinstance(msg, ResultMessage):
+                        break
 
-            return result_text
+                return result_text
+            finally:
+                # 清理临时图片文件
+                for f in saved_files:
+                    try:
+                        os.unlink(f)
+                    except OSError:
+                        pass
 
     @staticmethod
-    def _build_multimodal_prompt(text: str, images: list[dict]):
-        """构建包含图片的多模态输入（AsyncIterable[dict] 格式）。"""
-        content_blocks = []
-        # 图片放在文字前面，Claude 处理效果更好
+    def _save_images_and_build_prompt(text: str, images: list[dict], saved_files: list, temp_dir: str = "") -> str:
+        """将图片保存为临时文件，构建包含文件路径的文本提示。"""
+        ext_map = {
+            "image/png": ".png",
+            "image/jpeg": ".jpg",
+            "image/webp": ".webp",
+            "image/gif": ".gif",
+        }
+        if temp_dir:
+            os.makedirs(temp_dir, exist_ok=True)
+        paths = []
         for img in images:
-            content_blocks.append({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": img["media_type"],
-                    "data": img["data"],
-                },
-            })
+            ext = ext_map.get(img["media_type"], ".png")
+            fd, path = tempfile.mkstemp(suffix=ext, prefix="feishu_img_", dir=temp_dir or None)
+            try:
+                os.write(fd, base64.b64decode(img["data"]))
+            finally:
+                os.close(fd)
+            saved_files.append(path)
+            paths.append(path)
+
+        # 构建提示：让 Agent 先用 Read 工具读取图片再回复
+        img_hint = "\n".join(p for p in paths)
+        prompt = f"[系统] 用户通过飞书发送了 {len(paths)} 张图片，已保存到本地。你必须先使用 Read 工具读取以下图片文件，再回复用户。\n\n{img_hint}"
         if text:
-            content_blocks.append({"type": "text", "text": text})
-
-        async def _stream():
-            yield {
-                "type": "user",
-                "message": {
-                    "role": "user",
-                    "content": content_blocks,
-                },
-            }
-
-        return _stream()
+            prompt += f"\n\n用户消息：{text}"
+        return prompt
 
     async def close(self):
         if self._client and self._connected:
@@ -102,13 +117,15 @@ class AgentManager:
     """管理所有 Agent 会话，按 thread_id 隔离。使用专用事件循环保持连接存活。"""
 
     def __init__(self, cwd: str, allowed_tools: list[str], timeout_minutes: int = 30, max_agents: int = 3,
-                 on_cleanup: Callable[[str, str], None] | None = None):
+                 system_prompt: str = "", temp_dir: str = "", on_cleanup: Callable[[str, str], None] | None = None):
         """
         Args:
             on_cleanup: 清理回调，参数为 (reply_message_id, reason)，用于向话题推送通知。
         """
         self._cwd = cwd
         self._allowed_tools = allowed_tools
+        self._system_prompt = system_prompt
+        self._temp_dir = temp_dir
         self._timeout = timeout_minutes * 60
         self._cleanup_interval = 5 * 60
         self._max_agents = max_agents
@@ -159,7 +176,7 @@ class AgentManager:
                 self._notify_cleanup(oldest_key, "Agent 已被回收（达到数量上限，优先回收最久未活跃的会话）")
                 await self._sessions[oldest_key].close()
                 del self._sessions[oldest_key]
-            self._sessions[thread_key] = AgentSession(self._cwd, self._allowed_tools)
+            self._sessions[thread_key] = AgentSession(self._cwd, self._allowed_tools, self._system_prompt, self._temp_dir)
             logger.info("Created new agent session for thread: %s", thread_key)
 
         session = self._sessions[thread_key]

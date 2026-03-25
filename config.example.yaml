@@ -24,3 +24,8 @@ agent:
   allowed_tools: ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
   max_agents: 3
   timeout_minutes: 120
+  # 图片临时文件目录，不配置则使用系统临时目录
+  temp_dir: "/path/to/temp"
+  # 管理员 open_id 列表，只有这些用户可以审批 Agent 执行
+  # 留空则不启用审批，所有 @机器人 的消息直接执行
+  admin_ids: []

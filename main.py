@@ -3,6 +3,12 @@ import yaml
 
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
+from lark_oapi.event.callback.model.p2_card_action_trigger import (
+    P2CardActionTrigger,
+    P2CardActionTriggerResponse,
+    CallBackToast,
+    CallBackCard,
+)
 
 from providers.base import ProviderFactory
 # 导入以触发 register
@@ -101,9 +107,12 @@ def main():
         allowed_tools=agent_cfg.get("allowed_tools", ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]),
         timeout_minutes=agent_cfg.get("timeout_minutes", 120),
         max_agents=agent_cfg.get("max_agents", 3),
+        system_prompt=agent_cfg.get("system_prompt", ""),
+        temp_dir=agent_cfg.get("temp_dir", ""),
     )
 
     # 创建消息处理器
+    admin_ids = agent_cfg.get("admin_ids", [])
     handler = MessageHandler(
         providers=providers,
         default_provider=default_provider,
@@ -112,10 +121,33 @@ def main():
         agent_manager=agent_manager,
         bot_open_id=bot_open_id,
         feishu_cfg=feishu_cfg,
+        admin_ids=admin_ids,
     )
 
     # 注册 Agent 清理通知回调
     agent_manager._on_cleanup = lambda msg_id, reason: handler._reply_to_message(msg_id, f"⚠️ {reason}")
+
+    # 定义卡片按钮回调
+    def on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
+        try:
+            event = data.event
+            action = event.action
+            action_value = action.value
+            operator_id = event.operator.open_id
+            logger.info("收到卡片操作: operator=%s, value=%s", operator_id, action_value)
+            result = handler.handle_card_action(action_value, operator_id)
+
+            resp = P2CardActionTriggerResponse()
+            resp.toast = CallBackToast(result["toast"])
+            if "card" in result:
+                card = CallBackCard()
+                card.type = "raw"
+                card.data = result["card"]
+                resp.card = card
+            return resp
+        except Exception:
+            logger.exception("处理卡片操作时出错")
+            return P2CardActionTriggerResponse()
 
     # 定义事件回调
     def on_message(data: P2ImMessageReceiveV1):
@@ -144,7 +176,8 @@ def main():
     # 构建事件处理器
     event_handler = lark.EventDispatcherHandler.builder(
         "", ""  # verification token 和 encrypt key，WebSocket 模式下留空
-    ).register_p2_im_message_receive_v1(on_message).build()
+    ).register_p2_im_message_receive_v1(on_message) \
+     .register_p2_card_action_trigger(on_card_action).build()
 
     # 使用 WebSocket 长连接模式启动（无需公网地址）
     cli = lark.ws.Client(
@@ -159,6 +192,10 @@ def main():
     logger.info(f"默认模型: {providers[default_provider].name}")
     logger.info(f"已加载模型: {', '.join(p.name for p in providers.values())}")
     logger.info(f"Agent 工作目录: {agent_cfg.get('cwd', '.')}")
+    if admin_ids:
+        logger.info(f"审批模式: 已启用 ({len(admin_ids)} 个管理员)")
+    else:
+        logger.info("审批模式: 未启用（所有 @消息 直接执行）")
     logger.info("=" * 50)
 
     cli.start()

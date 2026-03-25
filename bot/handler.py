@@ -4,6 +4,7 @@ import logging
 import re
 import threading
 import time
+import uuid
 
 import httpx
 import lark_oapi as lark
@@ -20,6 +21,48 @@ from bot.session import SessionManager
 from bot.agent_manager import AgentManager
 
 logger = logging.getLogger(__name__)
+
+
+def _build_approval_card(request_id: str, user_id: str, text: str) -> str:
+    """构建审批卡片 JSON。"""
+    # 截断过长的消息预览
+    preview = text if len(text) <= 200 else text[:200] + "..."
+    card = {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": "🔒 Agent 执行审批"},
+            "template": "orange",
+        },
+        "elements": [
+            {
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": f"**发送者：** <at id={user_id}></at>"},
+            },
+            {
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": f"**消息内容：**\n{preview}"},
+            },
+            {"tag": "hr"},
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "✅ 批准执行"},
+                        "type": "primary",
+                        "value": {"action": "approve", "request_id": request_id},
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "❌ 拒绝"},
+                        "type": "danger",
+                        "value": {"action": "reject", "request_id": request_id},
+                    },
+                ],
+            },
+        ],
+    }
+    return json.dumps(card)
 
 # 命令 -> provider key 的映射
 COMMAND_MAP = {
@@ -55,6 +98,7 @@ class MessageHandler:
         agent_manager: AgentManager,
         bot_open_id: str = "",
         feishu_cfg: dict | None = None,
+        admin_ids: list[str] | None = None,
     ):
         self.providers = providers
         self.default_provider = default_provider
@@ -63,7 +107,10 @@ class MessageHandler:
         self.agent_manager = agent_manager
         self.bot_open_id = bot_open_id
         self._feishu_cfg = feishu_cfg or {}
+        self._admin_ids = admin_ids or []
         self._processed_msgs: dict[str, float] = {}
+        # 待审批请求：request_id -> {message_id, text, images, user_id, timestamp}
+        self._pending_requests: dict[str, dict] = {}
 
     def handle(self, event_data: dict):
         """处理飞书消息事件"""
@@ -105,7 +152,11 @@ class MessageHandler:
         if msg_type == "text":
             text = content.get("text", "").strip()
         elif msg_type == "post":
-            text = self._extract_post_text(content)
+            text, image_keys = self._extract_post_content(content)
+            for ik in image_keys:
+                img = self._download_image(message_id, ik)
+                if img:
+                    images.append(img)
         elif msg_type == "image":
             image_key = content.get("image_key", "")
             if image_key:
@@ -126,9 +177,9 @@ class MessageHandler:
         if not text and not images:
             return
 
-        # 如果只有图片没有文字，加个默认提示
+        # 只有图片没有文字也允许继续（agent_manager 会处理）
         if not text and images:
-            text = "请查看这张图片"
+            text = ""
 
         # 话题内消息 → 路由到 Agent
         if thread_id:
@@ -138,6 +189,10 @@ class MessageHandler:
         # 话题外的命令处理
         if text == "/help":
             self._reply(chat_id, HELP_TEXT)
+            return
+
+        if text == "/myid":
+            self._reply(chat_id, f"你的 open_id: `{user_id}`")
             return
 
         if text == "/model":
@@ -164,12 +219,95 @@ class MessageHandler:
                 self._handle_provider_chat(key, chat_id, user_id, user_text)
                 return
 
-        # 普通消息 → 创建话题 + Agent（异步执行，不阻塞后续消息）
-        threading.Thread(
-            target=self._handle_new_agent_thread,
-            args=(message_id, text, images),
-            daemon=True,
-        ).start()
+        # 普通消息 → 管理员直接执行，非管理员需要审批
+        if self._admin_ids and user_id not in self._admin_ids:
+            self._send_approval_request(message_id, chat_id, text, images, user_id)
+        else:
+            threading.Thread(
+                target=self._handle_new_agent_thread,
+                args=(message_id, text, images),
+                daemon=True,
+            ).start()
+
+    def _send_approval_request(self, message_id: str, chat_id: str, text: str,
+                                images: list[dict], user_id: str):
+        """发送审批卡片，等待管理员批准。"""
+        request_id = uuid.uuid4().hex[:12]
+        self._pending_requests[request_id] = {
+            "message_id": message_id,
+            "chat_id": chat_id,
+            "text": text,
+            "images": images,
+            "user_id": user_id,
+            "timestamp": time.time(),
+        }
+        # 清理超过 30 分钟的过期请求
+        cutoff = time.time() - 1800
+        self._pending_requests = {
+            k: v for k, v in self._pending_requests.items()
+            if v["timestamp"] > cutoff
+        }
+
+        card_json = _build_approval_card(request_id, user_id, text)
+        body = ReplyMessageRequestBody.builder() \
+            .msg_type("interactive") \
+            .content(card_json) \
+            .build()
+        request = ReplyMessageRequest.builder() \
+            .message_id(message_id) \
+            .request_body(body) \
+            .build()
+        resp = self.lark_client.im.v1.message.reply(request)
+        if not resp.success():
+            logger.error("发送审批卡片失败: %s - %s", resp.code, resp.msg)
+
+    def handle_card_action(self, action_value: dict, operator_id: str) -> dict:
+        """处理卡片按钮点击事件。返回 {toast, card?}。"""
+        request_id = action_value.get("request_id", "")
+        action = action_value.get("action", "")
+
+        # 权限检查
+        if operator_id not in self._admin_ids:
+            logger.warning("非管理员尝试审批: %s", operator_id)
+            return {"toast": {"type": "info", "content": "⚠️ 你没有审批权限"}}
+
+        pending = self._pending_requests.pop(request_id, None)
+        if not pending:
+            return {"toast": {"type": "info", "content": "⚠️ 该请求已过期或已处理"}}
+
+        if action == "approve":
+            logger.info("管理员 %s 批准了请求 %s", operator_id, request_id)
+            # 启动 Agent
+            threading.Thread(
+                target=self._handle_new_agent_thread,
+                args=(pending["message_id"], pending["text"], pending["images"]),
+                daemon=True,
+            ).start()
+            return {
+                "toast": {"type": "success", "content": "已批准，Agent 正在启动"},
+                "card": self._build_result_card("✅ Agent 执行已批准", "green",
+                    f"**审批人：** <at id={operator_id}></at>\n**状态：** 已批准，Agent 正在执行"),
+            }
+        else:
+            logger.info("管理员 %s 拒绝了请求 %s", operator_id, request_id)
+            return {
+                "toast": {"type": "info", "content": "已拒绝"},
+                "card": self._build_result_card("❌ Agent 执行已拒绝", "red",
+                    f"**审批人：** <at id={operator_id}></at>\n**状态：** 已拒绝"),
+            }
+
+    @staticmethod
+    def _build_result_card(title: str, template: str, content: str) -> dict:
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": title},
+                "template": template,
+            },
+            "elements": [
+                {"tag": "div", "text": {"tag": "lark_md", "content": content}},
+            ],
+        }
 
     def _handle_provider_chat(self, provider_key: str, chat_id: str, user_id: str, text: str):
         """使用指定 provider 进行对话（原有逻辑）。"""
@@ -274,9 +412,10 @@ class MessageHandler:
         return None
 
     @staticmethod
-    def _extract_post_text(content: dict) -> str:
-        """从飞书 post（富文本）消息中提取纯文本。"""
+    def _extract_post_content(content: dict) -> tuple[str, list[str]]:
+        """从飞书 post（富文本）消息中提取纯文本和图片 key。"""
         parts = []
+        image_keys = []
         # post 结构: {"title": "...", "content": [[{tag, text}, ...], ...]}
         # 多语言时外层有 zh_cn/en_us 等 key
         post_body = content
@@ -303,10 +442,14 @@ class MessageHandler:
                     pass  # @提及，跳过
                 elif tag == "md":
                     line_texts.append(element.get("text", ""))
+                elif tag == "img":
+                    ik = element.get("image_key", "")
+                    if ik:
+                        image_keys.append(ik)
             if line_texts:
                 parts.append("".join(line_texts))
 
-        return "\n".join(parts).strip()
+        return "\n".join(parts).strip(), image_keys
 
     def _reply(self, chat_id: str, text: str):
         """向飞书群聊发送消息"""
