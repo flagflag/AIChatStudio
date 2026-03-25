@@ -1,0 +1,25 @@
+feishu:
+  app_id: "your-app-id"
+  app_secret: "your-app-secret"
+
+providers:
+  claude:
+    api_key: "sk-ant-..."
+    model: "claude-opus-4-6"
+  gemini:
+    api_key: "AIza..."
+    model: "gemini-2.0-flash"
+  openai:
+    api_key: "sk-..."
+    model: "gpt-4o"
+
+default_provider: "claude"
+
+session:
+  max_history: 20
+  timeout_minutes: 30
+
+agent:
+  cwd: "/path/to/agent/workspace"
+  allowed_tools: ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
+  max_agents: 3
