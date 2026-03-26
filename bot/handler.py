@@ -1,6 +1,7 @@
 import base64
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -16,6 +17,9 @@ from lark_oapi.api.im.v1 import (
     ReplyMessageRequest,
     ReplyMessageRequestBody,
 )
+from lark_oapi.api.docx.v1 import ListDocumentBlockRequest
+from lark_oapi.api.wiki.v2 import GetNodeSpaceRequest
+from lark_oapi.api.drive.v1 import DownloadMediaRequest
 
 from providers.base import AIProvider
 from bot.session import SessionManager
@@ -591,11 +595,14 @@ class MessageHandler:
         if hint_msg_id:
             self._reply_to_message(hint_msg_id, "🤖 审批已通过，正在处理中...")
 
-        # 拼接上下文
+        # 预取飞书文档 + 拼接上下文
+        doc_hint = self._fetch_feishu_docs(text)
         context = self._get_thread_context(thread_id)
         prompt = text
+        if doc_hint:
+            prompt = f"{doc_hint}\n\n{prompt}"
         if context:
-            prompt = f"{context}\n\n[用户消息]\n{text}"
+            prompt = f"{context}\n\n[用户消息]\n{prompt}"
 
         try:
             reply = self.agent_manager.chat(thread_id, prompt, images=images)
@@ -624,8 +631,11 @@ class MessageHandler:
             self._reply_to_message(hint_msg_id, "🤖 审批已通过，Agent 正在处理中...")
 
         thread_key = thread_id or f"pending:{message_id}"
+        # 预取飞书文档
+        doc_hint = self._fetch_feishu_docs(text)
+        prompt = f"{doc_hint}\n\n{text}" if doc_hint else text
         try:
-            reply = self.agent_manager.chat(thread_key, text, images=images)
+            reply = self.agent_manager.chat(thread_key, prompt, images=images)
         except Exception as e:
             logger.exception("Agent 调用失败")
             reply = f"Agent 调用失败: {e}"
@@ -651,8 +661,11 @@ class MessageHandler:
             thread_id = getattr(resp.data, "thread_id", None)
 
         thread_key = thread_id or f"pending:{message_id}"
+        # 预取飞书文档
+        doc_hint = self._fetch_feishu_docs(text)
+        prompt = f"{doc_hint}\n\n{text}" if doc_hint else text
         try:
-            reply = self.agent_manager.chat(thread_key, text, images=images)
+            reply = self.agent_manager.chat(thread_key, prompt, images=images)
         except Exception as e:
             logger.exception("Agent 调用失败")
             reply = f"Agent 调用失败: {e}"
@@ -673,6 +686,8 @@ class MessageHandler:
         """在已有话题内继续 Agent 对话（异步执行）。"""
         # 提取上下文（在启动线程前，避免竞态）
         context = self._get_thread_context(thread_id)
+        # 预取飞书文档
+        doc_hint = self._fetch_feishu_docs(text)
 
         def _run():
             # 先发提示
@@ -681,10 +696,12 @@ class MessageHandler:
             if resp and resp.success() and resp.data:
                 hint_msg_id = getattr(resp.data, "message_id", None)
 
-            # 拼接上下文
+            # 拼接上下文和文档提示
             prompt = text
+            if doc_hint:
+                prompt = f"{doc_hint}\n\n{prompt}"
             if context:
-                prompt = f"{context}\n\n[用户消息]\n{text}"
+                prompt = f"{context}\n\n[用户消息]\n{prompt}"
 
             try:
                 reply = self.agent_manager.chat(thread_id, prompt, images=images)
@@ -762,6 +779,165 @@ class MessageHandler:
         except Exception:
             logger.exception("获取群聊名称异常: %s", chat_id)
         return ""
+
+    # ── 飞书文档预取 ──────────────────────────────────────────
+
+    _FEISHU_DOC_RE = re.compile(
+        r"https?://[a-zA-Z0-9_-]+\.feishu\.cn/(docx|wiki|docs)/([a-zA-Z0-9]+)"
+    )
+
+    def _fetch_feishu_docs(self, text: str) -> str:
+        """检测消息中的飞书文档链接，拉取内容保存到 temp_dir，返回提示文本。"""
+        matches = self._FEISHU_DOC_RE.findall(text)
+        if not matches:
+            return ""
+
+        temp_dir = self.agent_manager._temp_dir
+        if temp_dir:
+            os.makedirs(temp_dir, exist_ok=True)
+
+        hints = []
+        for doc_type, token in matches:
+            url = f"feishu.cn/{doc_type}/{token}"
+            try:
+                doc_id = self._resolve_doc_token(doc_type, token)
+                if not doc_id:
+                    logger.warning("无法解析飞书文档 token: %s", url)
+                    continue
+                md_path = self._download_doc_to_file(doc_id, token, temp_dir)
+                if md_path:
+                    hints.append(f"  {url} → {md_path}")
+                    logger.info("已预取飞书文档: %s → %s", url, md_path)
+            except Exception:
+                logger.exception("预取飞书文档失败: %s", url)
+
+        if not hints:
+            return ""
+
+        paths_text = "\n".join(hints)
+        return (
+            f"[系统] 用户消息中包含 {len(hints)} 个飞书文档链接，内容已保存到本地文件。"
+            f"请先使用 Read 工具读取以下文件，再回复用户。\n{paths_text}"
+        )
+
+    def _resolve_doc_token(self, doc_type: str, token: str) -> str | None:
+        """解析文档 token。wiki 类型需要先查询实际文档 token。"""
+        if doc_type in ("docx", "docs"):
+            return token
+
+        # wiki → 查询实际文档 token
+        request = GetNodeSpaceRequest.builder().token(token).build()
+        resp = self.lark_client.wiki.v2.space.get_node(request)
+        if resp.success() and resp.data and resp.data.node:
+            return resp.data.node.obj_token
+        logger.error("解析 wiki token 失败: %s - %s", resp.code, resp.msg)
+        return None
+
+    def _download_doc_to_file(self, doc_id: str, token: str, temp_dir: str) -> str | None:
+        """拉取文档所有 block，生成 markdown 文件（含图片），返回文件路径。"""
+        lines = []
+        page_token = None
+        img_counter = 0
+
+        while True:
+            builder = ListDocumentBlockRequest.builder() \
+                .document_id(doc_id) \
+                .page_size(500)
+            if page_token:
+                builder = builder.page_token(page_token)
+
+            resp = self.lark_client.docx.v1.document_block.list(builder.build())
+            if not resp.success():
+                logger.error("拉取文档 block 失败: %s - %s", resp.code, resp.msg)
+                return None
+
+            if resp.data and resp.data.items:
+                for block in resp.data.items:
+                    # 尝试提取文本内容
+                    text_obj = (
+                        block.text or block.heading1 or block.heading2 or
+                        block.heading3 or block.heading4 or block.heading5 or
+                        block.heading6 or block.heading7 or block.heading8 or
+                        block.heading9 or block.bullet or block.ordered or
+                        block.quote or block.todo or block.code
+                    )
+                    if text_obj and getattr(text_obj, "elements", None):
+                        line_text = ""
+                        for elem in text_obj.elements:
+                            if elem.text_run and elem.text_run.content:
+                                line_text += elem.text_run.content
+                        if not line_text:
+                            continue
+                        # 根据 block 类型添加 markdown 格式
+                        if block.heading1:
+                            line_text = f"# {line_text}"
+                        elif block.heading2:
+                            line_text = f"## {line_text}"
+                        elif block.heading3:
+                            line_text = f"### {line_text}"
+                        elif block.heading4:
+                            line_text = f"#### {line_text}"
+                        elif block.heading5:
+                            line_text = f"##### {line_text}"
+                        elif block.heading6:
+                            line_text = f"###### {line_text}"
+                        elif block.bullet:
+                            line_text = f"- {line_text}"
+                        elif block.ordered:
+                            line_text = f"1. {line_text}"
+                        elif block.quote:
+                            line_text = f"> {line_text}"
+                        elif block.todo:
+                            line_text = f"- [ ] {line_text}"
+                        elif block.code:
+                            line_text = f"```\n{line_text}\n```"
+                        lines.append(line_text)
+                        continue
+
+                    # 图片块
+                    if block.image and getattr(block.image, "token", None):
+                        img_counter += 1
+                        img_path = self._download_doc_image(
+                            block.image.token, token, img_counter, temp_dir
+                        )
+                        if img_path:
+                            lines.append(f"[图片 {img_counter}] {img_path}")
+
+            if not resp.data or not resp.data.has_more:
+                break
+            page_token = resp.data.page_token
+
+        if not lines:
+            return None
+
+        md_path = os.path.join(temp_dir or ".", f"feishu_doc_{token}.md")
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write("\n\n".join(lines))
+        return md_path
+
+    def _download_doc_image(self, file_token: str, doc_token: str,
+                            index: int, temp_dir: str) -> str | None:
+        """下载文档中的图片，保存到 temp_dir，返回路径。"""
+        try:
+            request = DownloadMediaRequest.builder().file_token(file_token).build()
+            resp = self.lark_client.drive.v1.media.download(request)
+            if not resp.success():
+                logger.error("下载文档图片失败: %s - %s", resp.code, resp.msg)
+                return None
+            img_bytes = resp.file.read()
+            # 检测格式
+            ext = ".png"
+            if img_bytes[:3] == b'\xff\xd8\xff':
+                ext = ".jpg"
+            elif img_bytes[:4] == b'RIFF' and len(img_bytes) > 12 and img_bytes[8:12] == b'WEBP':
+                ext = ".webp"
+            path = os.path.join(temp_dir or ".", f"feishu_doc_{doc_token}_img{index}{ext}")
+            with open(path, "wb") as f:
+                f.write(img_bytes)
+            return path
+        except Exception:
+            logger.exception("下载文档图片异常: %s", file_token)
+            return None
 
     @staticmethod
     def _extract_post_content(content: dict) -> tuple[str, list[str]]:
